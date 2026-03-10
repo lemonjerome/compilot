@@ -136,10 +136,10 @@ You should see a JSON response listing available models.
 
 ### 2. Pull the required model
 
-The agent uses `qwen2.5-coder:14b` by default. Pull it with:
+The agent uses `qwen3.5:9b` by default. Pull it with:
 
 ```bash
-ollama pull qwen2.5-coder:14b
+ollama pull qwen3.5:9b
 ```
 
 This is a 9 GB download. It only needs to be done once. The model is stored locally and used for all subsequent runs.
@@ -152,7 +152,7 @@ ollama pull nomic-embed-text
 
 This is a small model (~274 MB) used only for ranking tools, not for generating code.
 
-**Optional fallback model** — if `qwen2.5-coder:14b` fails to load (not enough VRAM), the orchestrator will automatically try `qwen3:7b`. Pull it now to have it ready:
+**Optional fallback model** — if `qwen3.5:9b` fails to load (not enough VRAM), the orchestrator will automatically try `qwen3:7b`. Pull it now to have it ready:
 
 ```bash
 ollama pull qwen3:7b
@@ -217,7 +217,7 @@ The UI server will start on `http://localhost:8000`. Ollama must be running loca
 | Variable | Default | Description |
 |---|---|---|
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama endpoint. In Docker use `http://host.docker.internal:11434` (set automatically). |
-| `ORCHESTRATOR_MODEL` | `qwen2.5-coder:14b` | Primary chat model. |
+| `ORCHESTRATOR_MODEL` | `qwen3.5:9b` | Primary chat model. |
 | `ORCHESTRATOR_FALLBACK_MODEL` | `qwen3:7b` | Fallback model if primary is unavailable. |
 | `EMBEDDING_MODEL` | `nomic-embed-text` | Embedding model for tool pruning. |
 | `ORCHESTRATOR_AGENT_NUM_CTX` | `40000` | LLM context window size. |

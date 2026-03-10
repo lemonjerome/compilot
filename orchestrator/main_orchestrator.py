@@ -22,7 +22,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--task", required=True, help="User task prompt")
     parser.add_argument(
         "--model",
-        default=os.environ.get("ORCHESTRATOR_MODEL", "qwen2.5-coder:14b"),
+        default=os.environ.get("ORCHESTRATOR_MODEL", "qwen3.5:9b"),
         help="Ollama model name",
     )
     parser.add_argument(

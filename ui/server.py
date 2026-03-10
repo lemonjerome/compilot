@@ -1156,7 +1156,7 @@ class UiHandler(BaseHTTPRequestHandler):
                         if "does not support tools" in lowered or "doesn't support tools" in lowered:
                             message = (
                                 "Selected model does not support tool calling (required for this agent). "
-                                "Set ORCHESTRATOR_MODEL to a tool-capable model (for example: qwen2.5-coder:14b). "
+                                "Set ORCHESTRATOR_MODEL to a tool-capable model (for example: qwen3.5:9b). "
                                 f"Details: {diagnostic}"
                             )
                         else:

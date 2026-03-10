@@ -36,7 +36,7 @@ class OllamaClient:
 
     def list_model_names(self) -> list[str]:
         if self._mock_enabled:
-            return ["qwen2.5-coder:14b", "nomic-embed-text"]
+            return ["qwen3.5:9b", "nomic-embed-text"]
 
         health = self.health()
         if not health.get("ok"):
