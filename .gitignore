@@ -1,3 +1,10 @@
+# Environment / secrets
+.env
+
+# Workspace projects (gitkeep keeps the folder, ignore everything inside)
+lch_workspaces/*
+!lch_workspaces/.gitkeep
+
 # Python bytecode and caches
 __pycache__/
 *.py[cod]
@@ -20,3 +27,8 @@ build/
 *.dylib
 
 Uncodixfy.md
+
+brainstorming
+
+# Local technical notes
+PROJECT_SUMMARY.md

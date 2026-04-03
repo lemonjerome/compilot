@@ -13,6 +13,22 @@ class OllamaClient:
         self.base_url = base_url.rstrip("/")
         self._mock_enabled = os.environ.get("ORCHESTRATOR_MOCK_TOOLCALL", "0") == "1"
         self._mock_turn = 0
+        self._api_key = os.environ.get("OLLAMA_API_KEY", "")
+
+    @property
+    def _is_cloud(self) -> bool:
+        return "ollama.com" in self.base_url
+
+    def _auth_headers(self, include_content_type: bool = True) -> dict[str, str]:
+        headers: dict[str, str] = {
+            "User-Agent": "low-cortisol-html/1.0",
+            "Accept": "application/json",
+        }
+        if include_content_type:
+            headers["Content-Type"] = "application/json"
+        if self._api_key:
+            headers["Authorization"] = f"Bearer {self._api_key}"
+        return headers
 
     def health(self) -> dict[str, Any]:
         if self._mock_enabled:
@@ -20,6 +36,7 @@ class OllamaClient:
 
         request = urllib.request.Request(
             f"{self.base_url}/api/tags",
+            headers=self._auth_headers(include_content_type=False),
             method="GET",
         )
         try:
@@ -60,6 +77,14 @@ class OllamaClient:
                 "pulled_models": [],
             }
 
+        if self._is_cloud:
+            return {
+                "ok": True,
+                "mode": "ollama_cloud",
+                "required_models": required_models,
+                "pulled_models": [],
+            }
+
         installed = set(self.list_model_names())
         pulled: list[str] = []
         for model in required_models:
@@ -81,6 +106,14 @@ class OllamaClient:
             return {
                 "ok": True,
                 "mode": "mock",
+                "chat_model": chat_model,
+                "embedding_model": embedding_model,
+            }
+
+        if self._is_cloud:
+            return {
+                "ok": True,
+                "mode": "ollama_cloud",
                 "chat_model": chat_model,
                 "embedding_model": embedding_model,
             }
@@ -139,7 +172,7 @@ class OllamaClient:
         request = urllib.request.Request(
             f"{self.base_url}/api/chat",
             data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
+            headers=self._auth_headers(),
             method="POST",
         )
 
@@ -179,7 +212,7 @@ class OllamaClient:
         request = urllib.request.Request(
             f"{self.base_url}/api/chat",
             data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
+            headers=self._auth_headers(),
             method="POST",
         )
 
@@ -257,7 +290,7 @@ class OllamaClient:
         request = urllib.request.Request(
             f"{self.base_url}/api/embed",
             data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
+            headers=self._auth_headers(),
             method="POST",
         )
         try:
@@ -384,14 +417,6 @@ class OllamaClient:
             cursor = end + len(marker)
         return blocks
 
-    def _parse_tool_calls_json(self, snippet: str) -> list[dict[str, Any]]:
-        try:
-            payload = json.loads(snippet)
-        except json.JSONDecodeError:
-            return []
-
-        return self._normalize_tool_call_payload(payload)
-
     def _normalize_tool_call_payload(self, payload: Any) -> list[dict[str, Any]]:
         if isinstance(payload, list):
             calls: list[dict[str, Any]] = []
@@ -448,7 +473,7 @@ class OllamaClient:
         request = urllib.request.Request(
             f"{self.base_url}/api/pull",
             data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
+            headers=self._auth_headers(),
             method="POST",
         )
 

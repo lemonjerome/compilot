@@ -7,9 +7,14 @@ services:
     working_dir: /app
     volumes:
       - ..:/app
-      - ${HOME}/Desktop/lch_workspaces:/root/Desktop/lch_workspaces
+      - ../lch_workspaces:/app/lch_workspaces
+    env_file:
+      - ../.env
     environment:
-      OLLAMA_BASE_URL: http://host.docker.internal:11434
+      OLLAMA_BASE_URL: https://ollama.com
+      ORCHESTRATOR_MODEL: qwen3-coder-next
+      ORCHESTRATOR_AGENT_NUM_CTX: "32768"
+      EMBEDDING_MODEL: nomic-embed-text
       WORKSPACE_ROOT: ""
       UI_HOST: 0.0.0.0
       UI_PORT: 8000

@@ -18,6 +18,28 @@ from urllib.parse import parse_qs, urlparse
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 UI_DIR = Path(__file__).resolve().parent
+
+
+def _load_dotenv() -> None:
+    """Load .env from the project root if it exists.
+
+    Existing env vars (e.g. from Docker or shell) are NOT overwritten.
+    """
+    env_path = PROJECT_ROOT / ".env"
+    if not env_path.is_file():
+        return
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and not os.environ.get(key):
+            os.environ[key] = value
+
+
+_load_dotenv()
 WORKSPACE_PREFIX = "lch_"
 
 
@@ -49,9 +71,8 @@ def _find_desktop() -> Path:
 
 
 def _default_workspaces_root() -> Path:
-    """Return ~/Desktop/lch_workspaces, creating it if it doesn't exist."""
-    desktop = _find_desktop()
-    root = (desktop / "lch_workspaces").resolve()
+    """Return <project_root>/lch_workspaces, creating it if it doesn't exist."""
+    root = (PROJECT_ROOT / "lch_workspaces").resolve()
     root.mkdir(parents=True, exist_ok=True)
     return root
 
@@ -895,7 +916,6 @@ class UiHandler(BaseHTTPRequestHandler):
                 ]
 
                 env = os.environ.copy()
-                env["ORCHESTRATOR_FAST_MODE"] = "1"
                 env.setdefault("ORCHESTRATOR_AGENT_NUM_CTX", "40000")
 
                 self.send_response(HTTPStatus.OK)
@@ -994,33 +1014,45 @@ class UiHandler(BaseHTTPRequestHandler):
                     if "[stream:planner]" in stripped:
                         text = _parse_stream_chunk_text(stripped.replace("[stream:planner]", "").strip())
                         if text:
-                            ndjson_event(self, {"type": "reasoning", "stage": "planner", "text": text})
-                        ndjson_event(self, {"type": "status", "state": "thinking", "label": "thinking..."})
+                            is_new = "planner" not in active_reasoning_streams
+                            emit_reasoning_stream_chunk(stage="planner", chunk_text=text, raw_chunk=True)
+                            if is_new:
+                                ndjson_event(self, {"type": "status", "state": "thinking", "label": "thinking..."})
                     elif "[stream:reranker]" in stripped:
                         text = _parse_stream_chunk_text(stripped.replace("[stream:reranker]", "").strip())
                         if text:
-                            ndjson_event(self, {"type": "reasoning", "stage": "reranker", "text": text})
-                        ndjson_event(self, {"type": "status", "state": "tools", "label": "getting tools..."})
+                            is_new = "reranker" not in active_reasoning_streams
+                            emit_reasoning_stream_chunk(stage="reranker", chunk_text=text, raw_chunk=True)
+                            if is_new:
+                                ndjson_event(self, {"type": "status", "state": "tools", "label": "getting tools..."})
                     elif "[stream_raw:architect]" in stripped:
                         text = stripped.replace("[stream_raw:architect]", "", 1).strip()
                         if text:
-                            ndjson_event(self, {"type": "reasoning", "stage": "architect", "text": text})
-                        ndjson_event(self, {"type": "status", "state": "working", "label": "working..."})
+                            is_new = "architect" not in active_reasoning_streams
+                            emit_reasoning_stream_chunk(stage="architect", chunk_text=text, raw_chunk=True)
+                            if is_new:
+                                ndjson_event(self, {"type": "status", "state": "working", "label": "working..."})
                     elif "[stream_raw:coder]" in stripped:
                         text = stripped.replace("[stream_raw:coder]", "", 1).strip()
                         if text:
-                            ndjson_event(self, {"type": "reasoning", "stage": "coder", "text": text})
-                        ndjson_event(self, {"type": "status", "state": "working", "label": "working..."})
+                            is_new = "coder" not in active_reasoning_streams
+                            emit_reasoning_stream_chunk(stage="coder", chunk_text=text, raw_chunk=True)
+                            if is_new:
+                                ndjson_event(self, {"type": "status", "state": "working", "label": "working..."})
                     elif "[stream:architect]" in stripped:
                         text = _parse_stream_chunk_text(stripped.replace("[stream:architect]", "").strip())
                         if text:
-                            ndjson_event(self, {"type": "reasoning", "stage": "architect", "text": text})
-                        ndjson_event(self, {"type": "status", "state": "working", "label": "working..."})
+                            is_new = "architect" not in active_reasoning_streams
+                            emit_reasoning_stream_chunk(stage="architect", chunk_text=text, raw_chunk=True)
+                            if is_new:
+                                ndjson_event(self, {"type": "status", "state": "working", "label": "working..."})
                     elif "[stream:coder]" in stripped:
                         text = _parse_stream_chunk_text(stripped.replace("[stream:coder]", "").strip())
                         if text:
-                            ndjson_event(self, {"type": "reasoning", "stage": "coder", "text": text})
-                        ndjson_event(self, {"type": "status", "state": "working", "label": "working..."})
+                            is_new = "coder" not in active_reasoning_streams
+                            emit_reasoning_stream_chunk(stage="coder", chunk_text=text, raw_chunk=True)
+                            if is_new:
+                                ndjson_event(self, {"type": "status", "state": "working", "label": "working..."})
                     elif "[tool:call]" in stripped:
                         payload_text = stripped.replace("[tool:call]", "").strip()
                         try:
@@ -1067,6 +1099,8 @@ class UiHandler(BaseHTTPRequestHandler):
                                 embedded_stage = str(_payload_obj["stage"]).strip() or "agent"
                         except (json.JSONDecodeError, ValueError):
                             pass
+                        # Close any live stream for this stage before appending static block
+                        close_reasoning_stage(embedded_stage)
                         text = _unwrap_response_payload(raw_agent_payload)
                         envelopes: dict[str, Any] = {"reasons": [], "tools": []}
                         if text:

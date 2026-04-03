@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fnmatch
 from pathlib import Path
 from typing import Any
 
@@ -192,4 +193,61 @@ def replace_range_tool(arguments: dict[str, Any], workspace_root: Path) -> dict[
         "effective_start_line": start_idx + 1,
         "effective_end_line": end_idx,
         "bytes_written": len(replacement.encode("utf-8")),
+    }
+
+
+def search_files_tool(arguments: dict[str, Any], workspace_root: Path) -> dict[str, Any]:
+    pattern = str(arguments.get("pattern", "**/*")).strip()
+    content_query = str(arguments.get("content_query", "")).strip()
+    max_results = min(int(arguments.get("max_results", 50)), 200)
+
+    # Reject absolute paths or traversal attempts
+    if pattern.startswith("/") or ".." in pattern:
+        raise ValueError("Pattern must be relative (no leading '/' or '..')")
+
+    # Collect all files under workspace, then match against pattern
+    all_files: list[Path] = []
+    try:
+        all_files = [p for p in workspace_root.rglob("*") if p.is_file()]
+    except Exception as exc:
+        raise ValueError(f"Could not list workspace: {exc}") from exc
+
+    # fnmatch against the relative path string so ** acts like a path wildcard
+    matched: list[Path] = []
+    for f in all_files:
+        rel = str(f.relative_to(workspace_root))
+        if fnmatch.fnmatch(rel, pattern) or fnmatch.fnmatch(f.name, pattern):
+            matched.append(f)
+
+    results: list[dict[str, Any]] = []
+    for f in matched:
+        if len(results) >= max_results:
+            break
+        rel = str(f.relative_to(workspace_root))
+        entry: dict[str, Any] = {"path": rel, "size_bytes": f.stat().st_size}
+
+        if content_query:
+            try:
+                text = f.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                continue
+            lower_text = text.lower()
+            lower_query = content_query.lower()
+            if lower_query not in lower_text:
+                continue  # skip files that don't contain the query
+            hits = [
+                {"line": i + 1, "content": line.rstrip()}
+                for i, line in enumerate(text.splitlines())
+                if lower_query in line.lower()
+            ]
+            entry["matches"] = hits[:10]
+
+        results.append(entry)
+
+    return {
+        "ok": True,
+        "pattern": pattern,
+        "content_query": content_query if content_query else None,
+        "count": len(results),
+        "files": results,
     }

@@ -12,6 +12,7 @@ from tools.file_tools import (
     create_file_tool,
     list_directory_tool,
     read_file_tool,
+    search_files_tool,
 )
 from tools.sandbox import resolve_workspace_root
 from tools.web_tools import plan_web_build_tool, run_unit_tests_tool, validate_web_app_tool
@@ -159,6 +160,40 @@ def _build_registry(workspace_root: str) -> ToolRegistry:
             handler=with_logging(
                 "plan_web_build",
                 lambda arguments: plan_web_build_tool(arguments, resolved_workspace),
+            ),
+        )
+    )
+
+    registry.register(
+        ToolDefinition(
+            name="search_files",
+            description=(
+                "Search for files in the workspace by glob pattern and/or content substring. "
+                "Use pattern='*.js' or '**/*.css'. "
+                "Set content_query to find files containing a specific string."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "pattern": {
+                        "type": "string",
+                        "description": "Glob pattern relative to workspace root (e.g. '*.js', '**/*.css')",
+                    },
+                    "content_query": {
+                        "type": "string",
+                        "description": "Optional substring to search for within matched files",
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Maximum number of files to return (default 50, max 200)",
+                    },
+                },
+                "required": [],
+                "additionalProperties": False,
+            },
+            handler=with_logging(
+                "search_files",
+                lambda arguments: search_files_tool(arguments, resolved_workspace),
             ),
         )
     )

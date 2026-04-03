@@ -37,6 +37,10 @@ TOOL_NAME_ALIASES: dict[str, str] = {
     "write_file": "create_file",
     "save_file": "create_file",
     "list_files": "list_directory",
+    "find_files": "search_files",
+    "glob_files": "search_files",
+    "search_workspace": "search_files",
+    "search_file": "search_files",
 }
 
 # Ordered pipeline stages
@@ -49,16 +53,47 @@ STAGES: list[tuple[str, str]] = [
 
 # Tools allowed per stage
 STAGE_TOOLS: dict[str, list[str]] = {
-    "feature_plan": ["plan_web_build", "read_file", "list_directory"],
-    "html_code": ["create_file", "read_file"],
-    "js_code": ["create_file", "read_file"],
-    "css_code": ["create_file", "read_file"],
+    "feature_plan": ["plan_web_build", "read_file", "list_directory", "search_files"],
+    "html_code": ["create_file", "read_file", "search_files"],
+    "js_code": ["create_file", "read_file", "search_files"],
+    "css_code": ["create_file", "read_file", "search_files"],
+    "test_code": ["create_file", "read_file", "run_unit_tests", "search_files"],
+}
+
+# Max iterations for the test feedback loop
+TEST_STAGE_MAX_ITERATIONS = 5
+
+# Per-stage max ReAct turns (overridable via ORCHESTRATOR_REACT_MAX_ITERS_<STAGE>)
+REACT_STAGE_MAX_ITERATIONS: dict[str, int] = {
+    "feature_plan": 4,
+    "html_code": 5,
+    "js_code": 6,
+    "css_code": 5,
+}
+
+# Expected primary output file per coding stage — used as a stop signal
+STAGE_PRIMARY_FILE: dict[str, str] = {
+    "html_code": "index.html",
+    "js_code": "script.js",
+    "css_code": "styles.css",
 }
 
 SYSTEM_PROMPT = (
     "You are a frontend coding agent that builds HTML/CSS/JS web apps.\n"
     "You work in sequential stages: plan features, write HTML, write JS, write CSS.\n"
     "Each stage focuses on ONE task. Follow the skill guides provided.\n"
+    "\n"
+    "REASONING AND ACTING (ReAct):\n"
+    "- Each stage allows multiple turns. Use them wisely.\n"
+    "- First turn: reason about what you need to know. Call read_file, search_files,\n"
+    "  or list_directory to explore and understand the workspace before writing.\n"
+    "- Subsequent turns: you will see tool results in context. Continue reasoning,\n"
+    "  call more tools if needed, or write the final output file.\n"
+    "- When you are ready to produce the output, call create_file with the\n"
+    "  COMPLETE file content. Do not call create_file with partial content.\n"
+    "- When you have nothing more to do in a stage, produce text output only\n"
+    "  (no tool calls). This signals the end of the stage.\n"
+    "- If a tool returns an error, adapt: try a different path or approach.\n"
     "\n"
     "CRITICAL RULES:\n"
     "- Use RELATIVE paths only (e.g. 'index.html', 'styles.css', 'script.js').\n"
@@ -85,6 +120,19 @@ SYSTEM_PROMPT = (
 )
 
 
+# Appended to the end of every coding stage prompt (html_code, js_code, css_code).
+# Position-aware: placing critical rules at the END improves recall vs. burying them mid-prompt.
+STAGE_TAIL_REMINDER = (
+    "\n---\n"
+    "CRITICAL STAGE COMPLETION REQUIREMENTS (read this last):\n"
+    "- Call create_file with the COMPLETE file content. Never partial — the full file.\n"
+    "- State toggle classes: ONLY `hidden`, `active`, `disabled`. Never `is-open`, `is-hidden`, `show`, `visible`.\n"
+    "- CSS must always define: `.hidden { display: none !important; }`\n"
+    "- JS must reference ONLY IDs and classes that exist in the HTML.\n"
+    "- When you have written the file, produce plain text only to end the stage (no more tool calls).\n"
+)
+
+
 def _env_int(name: str, default: int) -> int:
     raw = os.environ.get(name, "").strip()
     if not raw:
@@ -94,6 +142,12 @@ def _env_int(name: str, default: int) -> int:
     except ValueError:
         return default
     return value if value > 0 else default
+
+
+def _react_max_iters(stage_name: str) -> int:
+    """Return max ReAct iterations for a stage; overridable via env var."""
+    env_key = f"ORCHESTRATOR_REACT_MAX_ITERS_{stage_name.upper()}"
+    return _env_int(env_key, REACT_STAGE_MAX_ITERATIONS.get(stage_name, 4))
 
 
 class LoopController:
@@ -220,12 +274,21 @@ class LoopController:
 
         # --- Load skill files ---
         skill_texts: dict[str, str] = {}
-        for skill_name in ("html", "js", "css"):
+        for skill_name in ("html", "js", "css", "test"):
             skill_path = self.project_root / "skills" / f"{skill_name}.md"
             try:
                 skill_texts[skill_name] = skill_path.read_text(encoding="utf-8", errors="replace")
             except OSError:
                 skill_texts[skill_name] = ""
+
+        # --- Inject context efficiency skill (once at session start) ---
+        context_skill_path = self.project_root / "skills" / "context.md"
+        try:
+            context_skill = context_skill_path.read_text(encoding="utf-8", errors="replace")
+            if context_skill.strip():
+                memory.add("user", f"[Context Efficiency Guide]\n{context_skill}")
+        except OSError:
+            pass
 
         # --- Detect workspace state ---
         workspace_state = self._detect_workspace_state()
@@ -314,168 +377,30 @@ class LoopController:
             if is_code_stage:
                 num_predict = _env_int("ORCHESTRATOR_CODE_NUM_PREDICT", 16384)
 
-            # Call LLM with robust error handling
-            try:
-                print("[status:agent] calling model...", file=sys.stderr, flush=True)
-                response = self.ollama_client.chat(
-                    model=self.model_name,
-                    messages=memory.messages,
-                    tools=stage_tools,
-                    stream=False,
-                    num_ctx=_env_int("ORCHESTRATOR_AGENT_NUM_CTX", 40000),
-                    num_predict=num_predict,
-                )
-                message = self.ollama_client.extract_assistant_message(response)
-                content = str(message.get("content", ""))
-                tool_calls = self.ollama_client.extract_tool_calls(message)
-            except RuntimeError as err:
-                err_msg = str(err)
-                if "XML syntax error" in err_msg or "unexpected end element" in err_msg:
-                    self._emit_reasoning(stage_name, f"Model returned malformed XML, retrying without tools...")
-                    # Retry without tools to avoid XML parsing issue
-                    try:
-                        response = self.ollama_client.chat(
-                            model=self.model_name,
-                            messages=memory.messages,
-                            tools=[],
-                            stream=False,
-                            num_ctx=_env_int("ORCHESTRATOR_AGENT_NUM_CTX", 40000),
-                            num_predict=num_predict,
-                        )
-                        message = self.ollama_client.extract_assistant_message(response)
-                        content = str(message.get("content", ""))
-                        tool_calls = []
-                        # Try to extract tool calls from the text content
-                        if content.strip() and is_code_stage:
-                            tool_calls = self._extract_tool_calls_from_text(content)
-                    except RuntimeError:
-                        self._emit_reasoning(stage_name, f"Retry also failed. Skipping stage.")
-                        continue
-                else:
-                    raise
+            # --- ReAct loop for this stage ---
+            general_plan_text, created_files = self._run_react_stage(
+                stage_name=stage_name,
+                task=task,
+                memory=memory,
+                tool_trace=tool_trace,
+                created_files=created_files,
+                stage_tools=stage_tools,
+                num_predict=num_predict,
+                max_tool_calls=max_tool_calls,
+                base_iteration=iteration,
+                general_plan_text=general_plan_text,
+            )
 
-            # Normalize and deduplicate tool calls
-            tool_calls = [
-                {"name": n, "arguments": a}
-                for n, a in (self._normalize_tool_call(tc) for tc in tool_calls)
-            ]
-            tool_calls = self._deduplicate_tool_calls(tool_calls)
-
-            # Adaptive: extract tool calls from text if model wrote them inline
-            if not tool_calls and content.strip() and is_code_stage:
-                inline_calls = self._extract_tool_calls_from_text(content)
-                if inline_calls:
-                    tool_calls = inline_calls
-                    self._emit_reasoning(
-                        stage_name,
-                        f"Extracted {len(inline_calls)} tool call(s) from model text output",
-                    )
-
-            # Adaptive: retry on empty response
-            if not content.strip() and not tool_calls:
-                self._emit_reasoning(stage_name, "Empty model response, retrying...")
-                nudge = (
-                    f"You did not produce any output for stage {stage_name}. "
-                    "Please complete this stage now. "
-                    "Use the tools provided as instructed."
-                )
-                memory.add("user", nudge)
-                response = self.ollama_client.chat(
-                    model=self.model_name,
-                    messages=memory.messages,
-                    tools=stage_tools,
-                    stream=False,
-                    num_ctx=_env_int("ORCHESTRATOR_AGENT_NUM_CTX", 40000),
-                    num_predict=num_predict,
-                )
-                message = self.ollama_client.extract_assistant_message(response)
-                content = str(message.get("content", ""))
-                tool_calls = self.ollama_client.extract_tool_calls(message)
-                tool_calls = [
-                    {"name": n, "arguments": a}
-                    for n, a in (self._normalize_tool_call(tc) for tc in tool_calls)
-                ]
-                tool_calls = self._deduplicate_tool_calls(tool_calls)
-                if not tool_calls and content.strip() and is_code_stage:
-                    tool_calls = self._extract_tool_calls_from_text(content)
-
-            # Emit reasoning to UI
-            if content.strip():
-                self._emit_reasoning(stage_name, content)
-            elif tool_calls and is_code_stage:
-                file_names = []
-                for tc in tool_calls:
-                    tc_name = str(tc.get("name", ""))
-                    tc_args = tc.get("arguments", {})
-                    if tc_name in ("create_file", "write_file", "edit_file") and isinstance(tc_args, dict):
-                        rel = str(tc_args.get("relative_path", tc_args.get("file_path", ""))).strip()
-                        if rel:
-                            file_names.append(rel)
-                if file_names:
-                    self._emit_reasoning(stage_name, f"Writing files: {', '.join(file_names)}")
-
-            # Capture general plan text for downstream stages
-            clean_content = self._strip_think_tags(content).strip()
-            if stage_name == "feature_plan":
-                general_plan_text = clean_content
-
-            # Execute tool calls
-            allowed = set(STAGE_TOOLS.get(stage_name, []))
-            executed_count = 0
-
-            for call in tool_calls:
-                if executed_count >= max_tool_calls:
-                    break
-
-                name = str(call.get("name", "")).strip()
-                args = call.get("arguments", {})
-                if not isinstance(args, dict):
-                    args = {}
-
-                if name not in allowed:
-                    continue
-
-                # Skip empty file writes
-                if name == "create_file":
-                    rel = str(args.get("relative_path", "")).strip()
-                    content_val = str(args.get("content", ""))
-                    if not rel or not content_val.strip():
-                        continue
-
-                self._emit_tool_call_event(tool_name=name, arguments=args)
-                result = self._call_mcp_tool(name, args)
-
-                result_reasoning = self._format_tool_result_reasoning(name=name, result=result)
-                if result_reasoning:
-                    self._emit_reasoning(stage_name, result_reasoning)
-
-                # Emit file content as a code block for create_file
-                if name == "create_file":
-                    rel = str(args.get("relative_path", "")).strip()
-                    file_content = str(args.get("content", ""))
-                    if rel and file_content.strip():
-                        self._emit_code_block(rel, file_content)
-
-                tool_trace.append({
-                    "iteration": iteration,
-                    "stage": stage_name,
-                    "tool": name,
-                    "arguments": args,
-                    "result": result,
-                })
-                memory.add("tool", json.dumps(result), name=name)
-                executed_count += 1
-
-                # Track created files
-                if name == "create_file":
-                    rel = str(args.get("relative_path", "")).strip()
-                    nested = result.get("result") if isinstance(result, dict) else None
-                    if rel and isinstance(nested, dict) and nested.get("ok", False):
-                        created_files.add(rel)
-                        self.project_memory.mark_touched(rel)
-
-            memory.add("assistant", content, tool_calls=tool_calls)
-            self._compact_memory(memory)
+        # --- Run test stage (write tests, run, fix, loop until passing) ---
+        iteration = self._run_test_stage(
+            task=task,
+            memory=memory,
+            tool_trace=tool_trace,
+            created_files=created_files,
+            skill_texts=skill_texts,
+            iteration=iteration,
+            max_tool_calls=max_tool_calls,
+        )
 
         # --- Run validation at the end ---
         self._run_validation(tool_trace=tool_trace, memory=memory, iteration=iteration + 1)
@@ -540,6 +465,8 @@ class LoopController:
             lines.extend(self._build_css_code_prompt(
                 task, general_plan, created_files, workspace_state, skill_texts.get("css", ""),
             ))
+
+        # test_code is handled by _run_test_stage, not this builder
 
         return "\n".join(lines)
 
@@ -709,6 +636,7 @@ class LoopController:
             "  NOT only inside a welcome/empty-state section that disappears when items exist",
             "",
             "Call create_file with relative_path='index.html' and the full HTML content.",
+            STAGE_TAIL_REMINDER,
         ])
         return lines
 
@@ -796,6 +724,7 @@ class LoopController:
             "  Only use escapeHtml() inside innerHTML or template literals",
             "",
             "Call create_file with relative_path='script.js' and the full JS content.",
+            STAGE_TAIL_REMINDER,
         ])
         return lines
 
@@ -894,8 +823,612 @@ class LoopController:
             "- Every class in HTML and JS must have a corresponding CSS rule",
             "",
             "Call create_file with relative_path='styles.css' and the full CSS content.",
+            STAGE_TAIL_REMINDER,
         ])
         return lines
+
+    # ------------------------------------------------------------------
+    # Test stage — multi-turn feedback loop
+    # ------------------------------------------------------------------
+
+    def _run_test_stage(
+        self,
+        *,
+        task: str,
+        memory: SessionMemory,
+        tool_trace: list[dict[str, Any]],
+        created_files: set[str],
+        skill_texts: dict[str, str],
+        iteration: int,
+        max_tool_calls: int,
+    ) -> int:
+        """Write tests, run them, fix errors, repeat until all pass or max iterations."""
+        stage_name = "test_code"
+        stage_tools = self._get_pruned_tools(
+            query="Write and run unit tests for JavaScript logic",
+            stage_name=stage_name,
+        )
+
+        # Read the full script.js so the model has complete context
+        js_content = self._read_workspace_file("script.js")
+        html_content = self._read_workspace_file("index.html")
+
+        last_test_result: dict[str, Any] | None = None
+        tests_passed = False
+
+        for test_iter in range(TEST_STAGE_MAX_ITERATIONS):
+            iteration += 1
+            iter_label = f"test_code (attempt {test_iter + 1}/{TEST_STAGE_MAX_ITERATIONS})"
+            print(f"[status:agent] stage: {iter_label}", file=sys.stderr, flush=True)
+            self._emit_reasoning(stage_name, f"Starting test iteration {test_iter + 1}")
+
+            prompt = self._build_test_stage_prompt(
+                task=task,
+                js_content=js_content,
+                html_content=html_content,
+                skill_text=skill_texts.get("test", ""),
+                last_test_result=last_test_result,
+                test_iter=test_iter,
+                created_files=created_files,
+            )
+            memory.add("user", prompt)
+
+            num_predict = _env_int("ORCHESTRATOR_CODE_NUM_PREDICT", 16384)
+            try:
+                print("[status:agent] calling model...", file=sys.stderr, flush=True)
+                response = self.ollama_client.chat(
+                    model=self.model_name,
+                    messages=memory.messages,
+                    tools=stage_tools,
+                    stream=False,
+                    num_ctx=_env_int("ORCHESTRATOR_AGENT_NUM_CTX", 40000),
+                    num_predict=num_predict,
+                )
+                message = self.ollama_client.extract_assistant_message(response)
+                content = str(message.get("content", ""))
+                tool_calls = self.ollama_client.extract_tool_calls(message)
+            except RuntimeError as err:
+                err_msg = str(err)
+                if "XML syntax error" in err_msg or "unexpected end element" in err_msg:
+                    self._emit_reasoning(stage_name, "Malformed XML, retrying without tools...")
+                    try:
+                        response = self.ollama_client.chat(
+                            model=self.model_name,
+                            messages=memory.messages,
+                            tools=[],
+                            stream=False,
+                            num_ctx=_env_int("ORCHESTRATOR_AGENT_NUM_CTX", 32768),
+                            num_predict=num_predict,
+                        )
+                        message = self.ollama_client.extract_assistant_message(response)
+                        content = str(message.get("content", ""))
+                        tool_calls = self._extract_tool_calls_from_text(content)
+                    except RuntimeError:
+                        self._emit_reasoning(stage_name, "Retry failed. Ending test stage.")
+                        memory.add("assistant", content if "content" in dir() else "", tool_calls=[])  # type: ignore[possibly-undefined]
+                        break
+                elif "HTTP error 500" in err_msg or "Internal Server Error" in err_msg:
+                    self._emit_reasoning(stage_name, "Server error (500), retrying with reduced context...")
+                    system_msgs = [m for m in memory.messages if m.get("role") == "system"]
+                    recent_msgs = [m for m in memory.messages if m.get("role") != "system"][-4:]
+                    try:
+                        response = self.ollama_client.chat(
+                            model=self.model_name,
+                            messages=system_msgs + recent_msgs,
+                            tools=stage_tools,
+                            stream=False,
+                            num_predict=num_predict,
+                        )
+                        message = self.ollama_client.extract_assistant_message(response)
+                        content = str(message.get("content", ""))
+                        tool_calls = self.ollama_client.extract_tool_calls(message)
+                    except RuntimeError:
+                        self._emit_reasoning(stage_name, "Retry also failed. Ending test stage.")
+                        break
+                else:
+                    raise
+
+            # Normalize and deduplicate
+            tool_calls = [
+                {"name": n, "arguments": a}
+                for n, a in (self._normalize_tool_call(tc) for tc in tool_calls)
+            ]
+            tool_calls = self._deduplicate_tool_calls(tool_calls)
+            if not tool_calls and content.strip():
+                tool_calls = self._extract_tool_calls_from_text(content)
+
+            if content.strip():
+                self._emit_reasoning(stage_name, content)
+
+            # Execute tools; capture run_unit_tests result
+            allowed = set(STAGE_TOOLS.get(stage_name, []))
+            executed_count = 0
+
+            for call in tool_calls:
+                if executed_count >= max_tool_calls:
+                    break
+
+                name = str(call.get("name", "")).strip()
+                args = call.get("arguments", {})
+                if not isinstance(args, dict):
+                    args = {}
+                if name not in allowed:
+                    continue
+
+                # Skip empty file writes
+                if name == "create_file":
+                    rel = str(args.get("relative_path", "")).strip()
+                    content_val = str(args.get("content", ""))
+                    if not rel or not content_val.strip():
+                        continue
+
+                self._emit_tool_call_event(tool_name=name, arguments=args)
+                result = self._call_mcp_tool(name, args)
+
+                result_reasoning = self._format_tool_result_reasoning(name=name, result=result)
+                if result_reasoning:
+                    self._emit_reasoning(stage_name, result_reasoning)
+
+                if name == "create_file":
+                    rel = str(args.get("relative_path", "")).strip()
+                    file_content_val = str(args.get("content", ""))
+                    if rel and file_content_val.strip():
+                        self._emit_code_block(rel, file_content_val)
+
+                if name == "run_unit_tests":
+                    last_test_result = result
+                    nested = result.get("result") if isinstance(result, dict) else result
+                    if isinstance(nested, dict) and nested.get("ok"):
+                        stdout = str(nested.get("stdout", ""))
+                        stderr_out = str(nested.get("stderr", ""))
+                        # Tests pass when Node exits cleanly with no error output
+                        if nested.get("exit_code", 1) == 0 and not stderr_out.strip():
+                            tests_passed = True
+                            self._emit_reasoning(stage_name, "All tests passed.")
+
+                    # Re-read script.js in case the model just updated it
+                    js_content = self._read_workspace_file("script.js")
+
+                tool_trace.append({
+                    "iteration": iteration,
+                    "stage": stage_name,
+                    "tool": name,
+                    "arguments": args,
+                    "result": result,
+                })
+                memory.add("tool", json.dumps(result), name=name)
+                executed_count += 1
+
+                if name == "create_file":
+                    rel = str(args.get("relative_path", "")).strip()
+                    nested = result.get("result") if isinstance(result, dict) else None
+                    if rel and isinstance(nested, dict) and nested.get("ok", False):
+                        created_files.add(rel)
+                        self.project_memory.mark_touched(rel)
+
+            memory.add("assistant", content, tool_calls=tool_calls)
+            self._compact_memory(memory)
+
+            if tests_passed:
+                self._emit_reasoning(stage_name, "Test stage complete — all tests passing.")
+                break
+
+            # If model described a plan but called no tools, nudge it to act
+            if not tool_calls:
+                memory.add(
+                    "user",
+                    "[test_code] You output a description but called no tools. "
+                    "You MUST call create_file to write tests.js (and script.js if needed), "
+                    "then call run_unit_tests to execute them. Do not describe — act.",
+                )
+
+            if test_iter < TEST_STAGE_MAX_ITERATIONS - 1 and last_test_result is not None:
+                self._emit_reasoning(
+                    stage_name,
+                    f"Tests not yet passing. Starting correction iteration {test_iter + 2}...",
+                )
+
+        if not tests_passed:
+            self._emit_reasoning(
+                stage_name,
+                f"Test stage finished after {TEST_STAGE_MAX_ITERATIONS} iterations. "
+                "Some tests may still be failing.",
+            )
+
+        return iteration
+
+    def _read_workspace_file(self, relative_path: str) -> str:
+        """Read a file from the workspace root; return empty string if missing."""
+        try:
+            target = Path(self.workspace_root) / relative_path
+            if target.is_file():
+                return target.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+        return ""
+
+    def _build_test_stage_prompt(
+        self,
+        *,
+        task: str,
+        js_content: str,
+        html_content: str,
+        skill_text: str,
+        last_test_result: dict[str, Any] | None,
+        test_iter: int,
+        created_files: set[str],
+    ) -> str:
+        lines: list[str] = ["=== STAGE: test_code ===", ""]
+
+        if created_files:
+            lines.append("Known files: " + ", ".join(sorted(created_files)))
+            lines.append("")
+
+        if skill_text:
+            lines.extend([
+                "=== TEST SKILL GUIDE ===",
+                skill_text,
+                "=== END TEST SKILL GUIDE ===",
+                "",
+            ])
+
+        lines.extend([
+            "=== ORIGINAL TASK ===",
+            task,
+            "=== END TASK ===",
+            "",
+        ])
+
+        if html_content:
+            lines.extend([
+                "=== COMPLETED index.html ===",
+                html_content,
+                "=== END index.html ===",
+                "",
+            ])
+
+        if js_content:
+            lines.extend([
+                "=== COMPLETE script.js (full context) ===",
+                js_content,
+                "=== END script.js ===",
+                "",
+            ])
+
+        if test_iter == 0:
+            # First iteration: instruct model to write tests
+            lines.extend([
+                "TASK: Write a JavaScript unit test file called 'tests.js'.",
+                "",
+                "INSTRUCTIONS:",
+                "1. Use create_file to write 'tests.js' at the workspace root.",
+                "2. The file must test the core JavaScript logic in script.js.",
+                "3. Use Node.js built-in assert module (require('assert')).",
+                "4. Each test must be a plain function call — no test framework needed.",
+                "5. Extract and test pure functions from script.js where possible.",
+                "   If functions aren't exported, you may redefine the relevant logic inline.",
+                "6. After writing the file, call run_unit_tests with test_file='tests.js'.",
+                "7. You have up to " + str(TEST_STAGE_MAX_ITERATIONS) + " iterations to get all tests passing.",
+                "",
+                "TEST FILE FORMAT:",
+                "```",
+                "const assert = require('assert');",
+                "",
+                "// -- test helpers or extracted logic --",
+                "",
+                "// Test 1",
+                "assert.strictEqual(someFunction(input), expectedOutput, 'test description');",
+                "",
+                "// Test 2",
+                "assert.ok(anotherCheck, 'another test');",
+                "",
+                "console.log('All tests passed');",
+                "```",
+                "",
+                "IMPORTANT:",
+                "- The file name MUST be 'tests.js' (matches the run_unit_tests validator).",
+                "- Do NOT test DOM/browser APIs — Node.js has no DOM.",
+                "  Only test pure logic functions (formatters, calculators, state helpers, etc.).",
+                "- Use search_files if you need to confirm file names in the workspace.",
+            ])
+        else:
+            # Subsequent iterations: show previous result and ask for fixes
+            if last_test_result is not None:
+                nested = last_test_result.get("result") if isinstance(last_test_result, dict) else last_test_result
+                if isinstance(nested, dict):
+                    stdout = str(nested.get("stdout", "")).strip()
+                    stderr_out = str(nested.get("stderr", "")).strip()
+                    exit_code = nested.get("exit_code", "?")
+                    lines.extend([
+                        "=== LAST TEST RUN RESULT ===",
+                        f"Exit code: {exit_code}",
+                    ])
+                    if stdout:
+                        lines.extend(["stdout:", stdout])
+                    if stderr_out:
+                        lines.extend(["stderr:", stderr_out])
+                    lines.extend(["=== END TEST RESULT ===", ""])
+
+            lines.extend([
+                "TASK: Fix the failing tests.",
+                "",
+                "INSTRUCTIONS:",
+                "1. Read the test output above carefully.",
+                "2. Identify which assertion failed and why.",
+                "3. You may:",
+                "   a) Fix tests.js if the test expectations are wrong, OR",
+                "   b) Fix script.js if the application logic is wrong.",
+                "   c) Fix both if needed.",
+                "4. Use create_file to rewrite the corrected file(s).",
+                "5. Then call run_unit_tests with test_file='tests.js' to verify.",
+                "",
+                "Do NOT just tweak assertions to make them trivially pass — fix the real logic.",
+                "Use search_files or read_file if you need to inspect the workspace.",
+            ])
+
+        return "\n".join(lines)
+
+    # ------------------------------------------------------------------
+    # ReAct agent loop helpers
+    # ------------------------------------------------------------------
+
+    def _single_react_turn(
+        self,
+        *,
+        stage_name: str,
+        memory: SessionMemory,
+        stage_tools: list[dict[str, Any]],
+        num_predict: int,
+        is_code_stage: bool,
+    ) -> tuple[str, list[dict[str, Any]]]:
+        """Make one LLM call with XML-error retry and inline text extraction.
+
+        Returns (content, tool_calls) — normalized and deduplicated.
+        On unrecoverable error returns ("", []).
+        """
+        try:
+            print("[status:agent] calling model...", file=sys.stderr, flush=True)
+            response = self.ollama_client.chat(
+                model=self.model_name,
+                messages=memory.messages,
+                tools=stage_tools,
+                stream=False,
+                num_ctx=_env_int("ORCHESTRATOR_AGENT_NUM_CTX", 40000),
+                num_predict=num_predict,
+            )
+            message = self.ollama_client.extract_assistant_message(response)
+            content = str(message.get("content", ""))
+            tool_calls = self.ollama_client.extract_tool_calls(message)
+        except RuntimeError as err:
+            err_msg = str(err)
+            if "XML syntax error" in err_msg or "unexpected end element" in err_msg:
+                self._emit_reasoning(stage_name, "Model returned malformed XML, retrying without tools...")
+                try:
+                    response = self.ollama_client.chat(
+                        model=self.model_name,
+                        messages=memory.messages,
+                        tools=[],
+                        stream=False,
+                        num_ctx=_env_int("ORCHESTRATOR_AGENT_NUM_CTX", 32768),
+                        num_predict=num_predict,
+                    )
+                    message = self.ollama_client.extract_assistant_message(response)
+                    content = str(message.get("content", ""))
+                    tool_calls = []
+                    if content.strip() and is_code_stage:
+                        tool_calls = self._extract_tool_calls_from_text(content)
+                except RuntimeError:
+                    self._emit_reasoning(stage_name, "Retry also failed. Returning empty turn.")
+                    return "", []
+            elif "HTTP error 500" in err_msg or "Internal Server Error" in err_msg:
+                # Server-side crash — often caused by context overflow. Retry with
+                # a truncated message list (system + last 6 messages) and no ctx override.
+                self._emit_reasoning(stage_name, "Server error (500), retrying with reduced context...")
+                system_msgs = [m for m in memory.messages if m.get("role") == "system"]
+                recent_msgs = [m for m in memory.messages if m.get("role") != "system"][-6:]
+                try:
+                    response = self.ollama_client.chat(
+                        model=self.model_name,
+                        messages=system_msgs + recent_msgs,
+                        tools=stage_tools,
+                        stream=False,
+                        num_predict=num_predict,
+                    )
+                    message = self.ollama_client.extract_assistant_message(response)
+                    content = str(message.get("content", ""))
+                    tool_calls = self.ollama_client.extract_tool_calls(message)
+                except RuntimeError:
+                    self._emit_reasoning(stage_name, "Retry also failed. Returning empty turn.")
+                    return "", []
+            else:
+                raise
+
+        # Normalize and deduplicate
+        tool_calls = [
+            {"name": n, "arguments": a}
+            for n, a in (self._normalize_tool_call(tc) for tc in tool_calls)
+        ]
+        tool_calls = self._deduplicate_tool_calls(tool_calls)
+
+        # Adaptive: extract tool calls written inline in text
+        if not tool_calls and content.strip() and is_code_stage:
+            inline_calls = self._extract_tool_calls_from_text(content)
+            if inline_calls:
+                tool_calls = inline_calls
+                self._emit_reasoning(
+                    stage_name,
+                    f"Extracted {len(inline_calls)} tool call(s) from model text output",
+                )
+
+        return content, tool_calls
+
+    def _run_react_stage(
+        self,
+        *,
+        stage_name: str,
+        task: str,
+        memory: SessionMemory,
+        tool_trace: list[dict[str, Any]],
+        created_files: set[str],
+        stage_tools: list[dict[str, Any]],
+        num_predict: int,
+        max_tool_calls: int,
+        base_iteration: int,
+        general_plan_text: str,
+    ) -> tuple[str, set[str]]:
+        """Bounded multi-turn ReAct loop for one pipeline stage.
+
+        Returns (updated_general_plan_text, updated_created_files).
+        """
+        is_code_stage = stage_name.endswith("_code")
+        max_iters = _react_max_iters(stage_name)
+        primary_file = STAGE_PRIMARY_FILE.get(stage_name)
+        allowed = set(STAGE_TOOLS.get(stage_name, []))
+        primary_written = False
+
+        for react_iter in range(max_iters):
+            turn_label = f"turn {react_iter + 1}/{max_iters}"
+            print(f"[status:agent] {stage_name} ({turn_label})", file=sys.stderr, flush=True)
+
+            content, tool_calls = self._single_react_turn(
+                stage_name=stage_name,
+                memory=memory,
+                stage_tools=stage_tools,
+                num_predict=num_predict,
+                is_code_stage=is_code_stage,
+            )
+
+            # Empty response — nudge and retry on next iteration
+            if not content.strip() and not tool_calls:
+                self._emit_reasoning(stage_name, f"Empty response on {turn_label}, nudging...")
+                nudge = (
+                    f"[Stage {stage_name}, {turn_label}] You produced no output and called no tools. "
+                    "Please continue: reason about the task, call tools to explore the workspace if needed, "
+                    "or write the required output file."
+                )
+                memory.add("user", nudge)
+                continue
+
+            # Emit reasoning
+            if content.strip():
+                self._emit_reasoning(stage_name, content)
+            elif tool_calls and is_code_stage:
+                file_names = [
+                    str(tc.get("arguments", {}).get("relative_path", "")).strip()
+                    for tc in tool_calls
+                    if tc.get("name") == "create_file"
+                ]
+                if file_names := [f for f in file_names if f]:
+                    self._emit_reasoning(stage_name, f"Writing files: {', '.join(file_names)}")
+
+            # Capture general plan text from feature_plan content
+            if stage_name == "feature_plan":
+                clean = self._strip_think_tags(content).strip()
+                if clean:
+                    general_plan_text = clean
+
+            # Execute tool calls
+            executed_count = 0
+            for call in tool_calls:
+                if executed_count >= max_tool_calls:
+                    break
+
+                name = str(call.get("name", "")).strip()
+                args = call.get("arguments", {})
+                if not isinstance(args, dict):
+                    args = {}
+                if name not in allowed:
+                    continue
+
+                # Skip empty create_file calls
+                if name == "create_file":
+                    rel = str(args.get("relative_path", "")).strip()
+                    content_val = str(args.get("content", ""))
+                    if not rel or not content_val.strip():
+                        continue
+
+                self._emit_tool_call_event(tool_name=name, arguments=args)
+                result = self._call_mcp_tool(name, args)
+
+                result_reasoning = self._format_tool_result_reasoning(name=name, result=result)
+                if result_reasoning:
+                    self._emit_reasoning(stage_name, result_reasoning)
+
+                if name == "create_file":
+                    rel = str(args.get("relative_path", "")).strip()
+                    file_content_val = str(args.get("content", ""))
+                    if rel and file_content_val.strip():
+                        self._emit_code_block(rel, file_content_val)
+
+                tool_trace.append({
+                    "iteration": base_iteration,
+                    "stage": stage_name,
+                    "tool": name,
+                    "arguments": args,
+                    "result": result,
+                })
+                memory.add("tool", json.dumps(result), name=name)
+                executed_count += 1
+
+                # Track created files and check primary output stop condition
+                if name == "create_file":
+                    rel = str(args.get("relative_path", "")).strip()
+                    nested = result.get("result") if isinstance(result, dict) else None
+                    if rel and isinstance(nested, dict) and nested.get("ok", False):
+                        created_files.add(rel)
+                        self.project_memory.mark_touched(rel)
+                        if primary_file and rel == primary_file:
+                            primary_written = True
+
+                # feature_plan done when plan_web_build is called
+                if stage_name == "feature_plan" and name == "plan_web_build":
+                    # Capture plan summary from tool result if available
+                    nested = result.get("result") if isinstance(result, dict) else {}
+                    if isinstance(nested, dict):
+                        summary = str(nested.get("summary", "")).strip()
+                        if summary and not general_plan_text:
+                            general_plan_text = summary
+                    memory.add("assistant", content, tool_calls=tool_calls)
+                    self._compact_memory(memory)
+                    return general_plan_text, created_files
+
+            memory.add("assistant", content, tool_calls=tool_calls)
+            self._compact_memory(memory)
+
+            # Stop: primary file written
+            if primary_written:
+                self._emit_reasoning(
+                    stage_name, f"Stage complete — {primary_file} written."
+                )
+                break
+
+            # Stop: model returned text but no tools
+            if not tool_calls:
+                if is_code_stage and not primary_written:
+                    # Model planned but didn't write the file — nudge it to act
+                    self._emit_reasoning(
+                        stage_name,
+                        f"You described your plan but did not call create_file. "
+                        f"Now call create_file with relative_path='{primary_file}' "
+                        f"and the COMPLETE file content. Do not describe it again — write it.",
+                    )
+                    memory.add(
+                        "user",
+                        f"[{stage_name}] You output a plan but did not call any tools. "
+                        f"You MUST now call create_file with relative_path='{primary_file}' "
+                        f"and the full file content. Do not output JSON or descriptions — "
+                        f"call the tool.",
+                    )
+                    continue
+                break
+
+        if is_code_stage and not primary_written:
+            self._emit_reasoning(
+                stage_name,
+                f"Warning: {stage_name} exhausted {max_iters} turns without writing {primary_file}.",
+            )
+
+        return general_plan_text, created_files
 
     # ------------------------------------------------------------------
     # Validation (informational — runs after code stage)
@@ -1605,7 +2138,13 @@ class LoopController:
     # ------------------------------------------------------------------
 
     def _compact_memory(self, memory: SessionMemory) -> None:
-        """Compact memory if it exceeds the character budget."""
+        """Compact memory if it exceeds the character budget.
+
+        Structured extraction preserves meaningful decision state:
+        - Which files were created and which tools were called
+        - Key reasoning snippets (first line of each assistant turn)
+        - Stage prompt labels (not full content)
+        """
         budget = _env_int("ORCHESTRATOR_MEMORY_CHAR_BUDGET", 120000)
         total = sum(len(str(m.get("content", ""))) + 50 for m in memory.messages)
         if total <= budget:
@@ -1618,24 +2157,64 @@ class LoopController:
             if len(memory.messages) > tail_count
             else list(memory.messages)
         )
-
         middle = (
             memory.messages[2:-tail_count]
             if len(memory.messages) > (2 + tail_count)
             else []
         )
-        summary_lines: list[str] = []
-        for item in middle[-10:]:
-            role = str(item.get("role", ""))
-            text = str(item.get("content", "")).strip()[:200]
-            if text:
-                summary_lines.append(f"- {role}: {text}")
+        if not middle:
+            return
 
-        summary_text = "Memory compacted. Prior conversation summary:\n" + (
-            "\n".join(summary_lines) if summary_lines else "- (no summary)"
-        )
+        files_created: list[str] = []
+        tool_calls_summary: list[str] = []
+        reasoning_snippets: list[str] = []
 
-        memory.messages = [*head, {"role": "user", "content": summary_text}, *tail]
+        for msg in middle:
+            role = msg.get("role", "")
+            content = str(msg.get("content") or "")
+            tool_calls = msg.get("tool_calls") or []
+
+            if role == "assistant":
+                if tool_calls:
+                    names: list[str] = []
+                    for tc in tool_calls:
+                        name = tc.get("name") or tc.get("function", {}).get("name", "?")
+                        args = tc.get("arguments") or tc.get("function", {}).get("arguments") or {}
+                        if isinstance(args, str):
+                            try:
+                                args = json.loads(args)
+                            except Exception:
+                                args = {}
+                        path = args.get("relative_path", "") if isinstance(args, dict) else ""
+                        names.append(f"{name}({path})" if path else name)
+                    tool_calls_summary.append("called: " + ", ".join(names))
+                first_line = next((ln.strip() for ln in content.split("\n") if ln.strip()), "")
+                if first_line:
+                    reasoning_snippets.append(first_line[:200])
+
+            elif role == "tool":
+                m = re.search(r'["\']?([a-zA-Z0-9_\-]+\.[a-z]{2,4})["\']?', content)
+                if m and "created" in content.lower():
+                    files_created.append(m.group(1))
+
+            elif role == "user" and len(content) > 500:
+                first_line = content.split("\n")[0][:120]
+                reasoning_snippets.append(f"[stage prompt] {first_line}")
+
+        lines: list[str] = ["[Context compacted — prior conversation summary]"]
+        if files_created:
+            lines.append("Files created so far: " + ", ".join(dict.fromkeys(files_created)))
+        if tool_calls_summary:
+            lines.append("Tool calls made:")
+            for s in tool_calls_summary[-8:]:
+                lines.append(f"  - {s}")
+        if reasoning_snippets:
+            lines.append("Key reasoning steps:")
+            for s in reasoning_snippets[-6:]:
+                lines.append(f"  - {s}")
+        lines.append(f"({len(middle)} messages summarized above)")
+
+        memory.messages = [*head, {"role": "user", "content": "\n".join(lines)}, *tail]
 
     # ------------------------------------------------------------------
     # Workspace helpers

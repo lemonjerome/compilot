@@ -571,7 +571,7 @@ document.getElementById("tutorialGotIt").addEventListener("click", () => {
 });
 
 document.getElementById("newProjectBtn").addEventListener("click", () => {
-  document.getElementById("newWorkspaceName").value = "lch_new_project";
+  document.getElementById("newWorkspaceName").value = "";
   document.getElementById("newProjectError").textContent = "";
   showModal("newProjectModal");
 });
@@ -582,11 +582,10 @@ document.getElementById("newProjectCreate").addEventListener("click", async () =
   const errorEl = document.getElementById("newProjectError");
   errorEl.textContent = "";
   try {
-    const workspaceName = document.getElementById("newWorkspaceName").value.trim();
-    if (!workspaceName.startsWith("lch_")) {
-      throw new Error("Folder name must start with 'lch_'.");
-    }
-    // Always create inside lch_workspaces
+    const rawName = document.getElementById("newWorkspaceName").value.trim();
+    if (!rawName) throw new Error("Please enter a project name.");
+    // Auto-prepend lch_ prefix so the user doesn't have to type it
+    const workspaceName = rawName.startsWith("lch_") ? rawName : "lch_" + rawName;
     await apiPost("/api/create-project", {
       parentDir: state.currentWorkspacesRoot,
       workspaceName,

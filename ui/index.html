@@ -48,9 +48,9 @@
     <div id="newProjectModal" class="modal-backdrop">
       <div class="modal">
         <h3>New Project</h3>
-        <p class="modal-subtext">Creates a new folder inside <code>lch_workspaces</code> on your Desktop.</p>
-        <label class="field-label">Folder name</label>
-        <input id="newWorkspaceName" type="text" value="lch_new_project" />
+        <p class="modal-subtext">Enter a name for your project.</p>
+        <label class="field-label">Project name</label>
+        <input id="newWorkspaceName" type="text" placeholder="my-app" />
         <div class="modal-actions">
           <button id="newProjectCancel" class="btn">Cancel</button>
           <button id="newProjectCreate" class="btn primary">Create</button>
@@ -62,7 +62,7 @@
     <div id="openProjectModal" class="modal-backdrop">
       <div class="modal">
         <h3>Open Project</h3>
-        <p class="modal-subtext">Choose a project from <code>lch_workspaces</code> on your Desktop.</p>
+        <p class="modal-subtext">Choose a project.</p>
         <div id="projectPickerList" class="project-picker-list"></div>
         <div id="openProjectError" class="error"></div>
         <div class="modal-actions">

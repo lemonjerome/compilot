@@ -8,6 +8,30 @@ import sys
 from pathlib import Path
 from typing import Any
 
+
+def _load_dotenv() -> None:
+    """Load .env from the project root (two levels up from this file) if it exists.
+
+    This is a minimal parser — no external dependency needed.
+    Lines starting with # or blank are skipped.
+    Existing env vars are NOT overwritten (shell takes precedence).
+    """
+    env_path = Path(__file__).resolve().parent.parent / ".env"
+    if not env_path.is_file():
+        return
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and not os.environ.get(key):
+            os.environ[key] = value
+
+
+_load_dotenv()
+
 from device_detection import detect_compute_backend
 from loop_controller import LoopController
 from ollama_client import OllamaClient
