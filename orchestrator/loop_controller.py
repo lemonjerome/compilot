@@ -78,6 +78,12 @@ STAGE_PRIMARY_FILE: dict[str, str] = {
     "css_code": "styles.css",
 }
 
+# Context window budgets for qwen3.5's 256k token window.
+# Conservative estimate: ~3 chars per token for mixed code + prose.
+# Soft = 200k tokens (normal ceiling). Hard = 250k tokens (emergency — still fits 256k with 6k margin).
+CONTEXT_SOFT_BUDGET_CHARS = 600_000   # ~200k tokens — normal compaction trigger
+CONTEXT_HARD_BUDGET_CHARS = 750_000   # ~250k tokens — emergency slim trigger
+
 SYSTEM_PROMPT = (
     "You are a frontend coding agent that builds HTML/CSS/JS web apps.\n"
     "You work in sequential stages: plan features, write HTML, write JS, write CSS.\n"
@@ -203,6 +209,11 @@ class LoopController:
             if name:
                 self._tools_by_name[name] = tool
 
+        # Runtime state — populated at the start of run() and updated during stages
+        self._pipeline_task: str = ""
+        self._plan_html_refs: dict[str, Any] = {}
+        self._plan_js_classes: list[str] = []
+
     # ------------------------------------------------------------------
     # Workspace detection
     # ------------------------------------------------------------------
@@ -263,6 +274,10 @@ class LoopController:
     # ------------------------------------------------------------------
 
     def run(self, task: str) -> dict[str, Any]:
+        self._pipeline_task = task
+        self._plan_html_refs = {}
+        self._plan_js_classes = []
+
         memory = SessionMemory()
         memory.add("system", SYSTEM_PROMPT)
         memory.add("user", f"Task: {task}")
@@ -1186,14 +1201,15 @@ class LoopController:
         Returns (content, tool_calls) — normalized and deduplicated.
         On unrecoverable error returns ("", []).
         """
+        slim_messages = self._slim_context_for_call(memory)
         try:
             print("[status:agent] calling model...", file=sys.stderr, flush=True)
             response = self.ollama_client.chat(
                 model=self.model_name,
-                messages=memory.messages,
+                messages=slim_messages,
                 tools=stage_tools,
                 stream=False,
-                num_ctx=_env_int("ORCHESTRATOR_AGENT_NUM_CTX", 40000),
+                num_ctx=_env_int("ORCHESTRATOR_AGENT_NUM_CTX", 200000),
                 num_predict=num_predict,
             )
             message = self.ollama_client.extract_assistant_message(response)
@@ -1206,10 +1222,10 @@ class LoopController:
                 try:
                     response = self.ollama_client.chat(
                         model=self.model_name,
-                        messages=memory.messages,
+                        messages=slim_messages,
                         tools=[],
                         stream=False,
-                        num_ctx=_env_int("ORCHESTRATOR_AGENT_NUM_CTX", 32768),
+                        num_ctx=_env_int("ORCHESTRATOR_AGENT_NUM_CTX", 200000),
                         num_predict=num_predict,
                     )
                     message = self.ollama_client.extract_assistant_message(response)
@@ -1379,6 +1395,17 @@ class LoopController:
                         self.project_memory.mark_touched(rel)
                         if primary_file and rel == primary_file:
                             primary_written = True
+                            # Extract cross-file references and update PLAN.md
+                            if rel == "index.html":
+                                written_content = str(args.get("content", ""))
+                                self._plan_html_refs = self._extract_html_refs(written_content)
+                                self._write_plan_md(general_plan_text, created_files)
+                            elif rel == "script.js":
+                                written_content = str(args.get("content", ""))
+                                self._plan_js_classes = self._extract_js_classes(written_content)
+                                self._write_plan_md(general_plan_text, created_files)
+                            elif rel == "styles.css":
+                                self._write_plan_md(general_plan_text, created_files)
 
                 # feature_plan done when plan_web_build is called
                 if stage_name == "feature_plan" and name == "plan_web_build":
@@ -1388,6 +1415,8 @@ class LoopController:
                         summary = str(nested.get("summary", "")).strip()
                         if summary and not general_plan_text:
                             general_plan_text = summary
+                    # Write initial PLAN.md with features and build status
+                    self._write_plan_md(general_plan_text, created_files)
                     memory.add("assistant", content, tool_calls=tool_calls)
                     self._compact_memory(memory)
                     return general_plan_text, created_files
@@ -2145,7 +2174,7 @@ class LoopController:
         - Key reasoning snippets (first line of each assistant turn)
         - Stage prompt labels (not full content)
         """
-        budget = _env_int("ORCHESTRATOR_MEMORY_CHAR_BUDGET", 120000)
+        budget = _env_int("ORCHESTRATOR_MEMORY_CHAR_BUDGET", CONTEXT_SOFT_BUDGET_CHARS)
         total = sum(len(str(m.get("content", ""))) + 50 for m in memory.messages)
         if total <= budget:
             return
@@ -2215,6 +2244,224 @@ class LoopController:
         lines.append(f"({len(middle)} messages summarized above)")
 
         memory.messages = [*head, {"role": "user", "content": "\n".join(lines)}, *tail]
+
+    # ------------------------------------------------------------------
+    # Context slimming — keeps full memory object, returns trimmed call list
+    # ------------------------------------------------------------------
+
+    def _slim_context_for_call(self, memory: SessionMemory) -> list[dict[str, Any]]:
+        """Return a trimmed message list for one LLM call, based on token estimates.
+
+        - Under soft budget (~200k tokens): pass full memory unchanged.
+        - Soft–hard range (200k–250k tokens): system + PLAN.md + last 12 messages.
+        - Over hard budget (>250k tokens): system + PLAN.md + last 6 messages (emergency).
+
+        The memory object itself is NOT modified — this only affects what is sent to the API.
+        """
+        total_chars = sum(len(str(m.get("content", ""))) for m in memory.messages)
+
+        if total_chars <= CONTEXT_SOFT_BUDGET_CHARS:
+            return memory.messages
+
+        # Over soft budget — slim
+        keep_tail = 12 if total_chars <= CONTEXT_HARD_BUDGET_CHARS else 6
+        level = "slim" if total_chars <= CONTEXT_HARD_BUDGET_CHARS else "emergency slim"
+
+        system_msgs = [m for m in memory.messages if m.get("role") == "system"]
+        tail = memory.messages[-keep_tail:]
+
+        plan_content = self._read_plan_md()
+        plan_msgs: list[dict[str, Any]] = []
+        if plan_content.strip():
+            plan_msgs = [{
+                "role": "user",
+                "content": (
+                    "[PLAN.md — project reference, read this for full context]\n"
+                    + plan_content
+                ),
+            }]
+
+        estimated_tokens = total_chars // 3
+        self._emit_reasoning_raw(
+            "system",
+            f"Context {level}: {estimated_tokens:,} tokens estimated "
+            f"(budget 200k). Keeping PLAN.md + last {keep_tail} messages.",
+        )
+        return system_msgs + plan_msgs + tail
+
+    # ------------------------------------------------------------------
+    # PLAN.md — workspace-level project reference file
+    # ------------------------------------------------------------------
+
+    def _plan_md_path(self) -> Path:
+        return self.workspace_root_path / "PLAN.md"
+
+    def _read_plan_md(self) -> str:
+        try:
+            return self._plan_md_path().read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return ""
+
+    def _write_plan_md(self, general_plan_text: str, created_files: set[str]) -> None:
+        """Write or update PLAN.md in the workspace with current build state and cross-file references."""
+        all_primary = ["index.html", "script.js", "styles.css"]
+        lines: list[str] = ["# PLAN.md\n"]
+
+        # Task
+        if self._pipeline_task:
+            lines.append(f"## Task\n{self._pipeline_task}\n")
+
+        # Features and architecture
+        if general_plan_text.strip():
+            lines.append(f"## Features & Architecture\n{general_plan_text.strip()}\n")
+
+        # Build status checklist
+        status = ["## Build Status"]
+        for f in all_primary:
+            mark = "x" if f in created_files else " "
+            status.append(f"- [{mark}] {f}")
+        lines.append("\n".join(status) + "\n")
+
+        # HTML element reference (populated after html_code stage)
+        if self._plan_html_refs:
+            refs = self._plan_html_refs
+            ref_lines = [
+                "## HTML Element Reference",
+                "> For: **script.js** — use these IDs in `getElementById`/`querySelector`",
+                "> For: **styles.css** — use these class names as selectors",
+                "",
+            ]
+            if refs.get("ids"):
+                ref_lines.append("### Element IDs")
+                for id_ in refs["ids"]:
+                    ref_lines.append(f"- `#{id_}`")
+                ref_lines.append("")
+            if refs.get("buttons"):
+                ref_lines.append("### Buttons")
+                for id_, label in refs["buttons"]:
+                    ref_lines.append(f'- `#{id_}` — "{label}"')
+                ref_lines.append("")
+            if refs.get("modal_ids"):
+                ref_lines.append("### Modals (start hidden — JS removes `.hidden` to show)")
+                for id_ in refs["modal_ids"]:
+                    ref_lines.append(f"- `#{id_}`")
+                ref_lines.append("")
+            meaningful_classes = [
+                c for c in refs.get("classes", [])
+                if c not in {"hidden", "active", "disabled", "btn"}
+            ]
+            if meaningful_classes:
+                ref_lines.append("### CSS Classes (must be styled in styles.css)")
+                ref_lines.append(", ".join(f"`.{c}`" for c in meaningful_classes[:40]))
+                ref_lines.append("")
+            lines.append("\n".join(ref_lines))
+
+        # JS dynamic classes (populated after js_code stage)
+        if self._plan_js_classes:
+            dynamic = [c for c in self._plan_js_classes if c not in {"hidden", "active", "disabled"}]
+            if dynamic:
+                js_lines = [
+                    "## JS Dynamic Classes",
+                    "> For: **styles.css** — must define CSS rules for ALL of these",
+                    "",
+                ]
+                for cls in dynamic:
+                    js_lines.append(f"- `.{cls}`")
+                lines.append("\n".join(js_lines) + "\n")
+
+        # Next steps hint
+        remaining = [f for f in all_primary if f not in created_files]
+        if remaining:
+            lines.append(f"## Next Steps\nStill to write: {', '.join(remaining)}\n")
+
+        content = "\n".join(lines)
+        try:
+            self._plan_md_path().write_text(content, encoding="utf-8")
+            done_count = sum(1 for f in all_primary if f in created_files)
+            self._emit_reasoning_raw("system", f"PLAN.md updated ({done_count}/3 files complete)")
+        except OSError as exc:
+            self._emit_reasoning_raw("system", f"Warning: could not write PLAN.md: {exc}")
+
+    def _extract_html_refs(self, html_content: str) -> dict[str, Any]:
+        """Extract element IDs, class names, modals, and buttons from HTML content."""
+        # Element IDs — preserve order, deduplicate
+        raw_ids = re.findall(r'\bid=["\']([^"\']+)["\']', html_content)
+        ids: list[str] = list(dict.fromkeys(raw_ids))
+
+        # All class names — flatten, deduplicate, preserve order
+        class_attr_values = re.findall(r'\bclass=["\']([^"\']+)["\']', html_content)
+        seen_cls: set[str] = set()
+        classes: list[str] = []
+        for val in class_attr_values:
+            for cls in val.split():
+                if cls and cls not in seen_cls:
+                    seen_cls.add(cls)
+                    classes.append(cls)
+
+        # Modal IDs — IDs that have class containing "modal" or "overlay", or start with "hidden"
+        modal_ids: list[str] = []
+        for id_ in ids:
+            # Find the element line containing this ID
+            pattern = rf'\bid=["\']({re.escape(id_)})["\'][^>]*class=["\']([^"\']*)["\']'
+            m = re.search(pattern, html_content)
+            if not m:
+                pattern = rf'class=["\']([^"\']*)["\'][^>]*\bid=["\']({re.escape(id_)})["\']'
+                m = re.search(pattern, html_content)
+                if m:
+                    cls_val = m.group(1)
+                else:
+                    cls_val = ""
+            else:
+                cls_val = m.group(2)
+            cls_lower = cls_val.lower()
+            id_lower = id_.lower()
+            if ("modal" in cls_lower or "overlay" in cls_lower or
+                    "modal" in id_lower or "overlay" in id_lower or
+                    "hidden" in cls_lower.split()):
+                modal_ids.append(id_)
+
+        # Buttons — id + visible text label
+        button_pattern = re.findall(
+            r'<button[^>]*\bid=["\']([^"\']+)["\'][^>]*>([^<]*)</button>',
+            html_content,
+        )
+        buttons = [(id_.strip(), text.strip()) for id_, text in button_pattern if id_.strip()]
+
+        return {
+            "ids": ids,
+            "classes": classes,
+            "modal_ids": modal_ids,
+            "buttons": buttons,
+        }
+
+    def _extract_js_classes(self, js_content: str) -> list[str]:
+        """Extract dynamic class names from JS classList calls and className assignments."""
+        seen: set[str] = set()
+        classes: list[str] = []
+
+        def _add(cls_str: str) -> None:
+            for cls in cls_str.split():
+                if cls and cls not in seen:
+                    seen.add(cls)
+                    classes.append(cls)
+
+        # classList.add/remove/toggle/replace('name') or ("name")
+        for m in re.finditer(r'classList\.\w+\(\s*["\']([^"\']+)["\']', js_content):
+            _add(m.group(1))
+
+        # .className = 'name' or .className = "name" or += "name"
+        for m in re.finditer(r'\.className\s*[+]?=\s*["\']([^"\']+)["\']', js_content):
+            _add(m.group(1))
+
+        # innerHTML / template literals: class="name" or class='name'
+        for m in re.finditer(r'\bclass=["\']([^"\']+)["\']', js_content):
+            _add(m.group(1))
+
+        # el.setAttribute('class', 'name')
+        for m in re.finditer(r'setAttribute\s*\(\s*["\']class["\'],\s*["\']([^"\']+)["\']', js_content):
+            _add(m.group(1))
+
+        return classes
 
     # ------------------------------------------------------------------
     # Workspace helpers
