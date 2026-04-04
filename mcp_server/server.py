@@ -9,9 +9,12 @@ from tool_registry import ToolDefinition, ToolRegistry
 from tools.action_logger import log_tool_action
 from tools.dummy_tools import sandbox_echo_path
 from tools.file_tools import (
+    append_to_file_tool,
     create_file_tool,
+    insert_after_marker_tool,
     list_directory_tool,
     read_file_tool,
+    replace_range_tool,
     search_files_tool,
 )
 from tools.sandbox import resolve_workspace_root
@@ -194,6 +197,81 @@ def _build_registry(workspace_root: str) -> ToolRegistry:
             handler=with_logging(
                 "search_files",
                 lambda arguments: search_files_tool(arguments, resolved_workspace),
+            ),
+        )
+    )
+
+    registry.register(
+        ToolDefinition(
+            name="replace_range",
+            description=(
+                "Replace a contiguous line range in an existing file with new content. "
+                "Use for surgical fixes — avoids rewriting the whole file. "
+                "Lines are 1-indexed. end_line is inclusive."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "relative_path": {"type": "string"},
+                    "start_line": {"type": "integer", "description": "First line to replace (1-indexed)"},
+                    "end_line": {"type": "integer", "description": "Last line to replace (1-indexed, inclusive)"},
+                    "content": {"type": "string", "description": "Replacement text"},
+                },
+                "required": ["relative_path", "start_line", "end_line", "content"],
+                "additionalProperties": False,
+            },
+            handler=with_logging(
+                "replace_range",
+                lambda arguments: replace_range_tool(arguments, resolved_workspace),
+            ),
+        )
+    )
+
+    registry.register(
+        ToolDefinition(
+            name="append_to_file",
+            description="Append content to the end of an existing file without rewriting it.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "relative_path": {"type": "string"},
+                    "content": {"type": "string"},
+                },
+                "required": ["relative_path", "content"],
+                "additionalProperties": False,
+            },
+            handler=with_logging(
+                "append_to_file",
+                lambda arguments: append_to_file_tool(arguments, resolved_workspace),
+            ),
+        )
+    )
+
+    registry.register(
+        ToolDefinition(
+            name="insert_after_marker",
+            description=(
+                "Insert content immediately after a unique marker string in an existing file. "
+                "Useful for adding CSS rules or JS functions without touching the rest of the file."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "relative_path": {"type": "string"},
+                    "marker": {"type": "string", "description": "Unique string to search for in the file"},
+                    "content": {"type": "string", "description": "Text to insert after the marker"},
+                    "occurrence": {
+                        "type": "string",
+                        "enum": ["first", "last"],
+                        "description": "Which occurrence of marker to use (default: first)",
+                    },
+                },
+                "required": ["relative_path", "marker", "content"],
+                "additionalProperties": False,
+            },
+            handler=with_logging(
+                "insert_after_marker",
+                lambda arguments: insert_after_marker_tool(arguments, resolved_workspace),
             ),
         )
     )

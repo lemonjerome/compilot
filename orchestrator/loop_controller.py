@@ -52,23 +52,27 @@ STAGES: list[tuple[str, str]] = [
 ]
 
 # Tools allowed per stage
+# css_code and js_code get surgical edit tools (replace_range, append_to_file,
+# insert_after_marker) so the model can fix a file without rewriting it entirely.
 STAGE_TOOLS: dict[str, list[str]] = {
     "feature_plan": ["plan_web_build", "read_file", "list_directory", "search_files"],
-    "html_code": ["create_file", "read_file", "search_files"],
-    "js_code": ["create_file", "read_file", "search_files"],
-    "css_code": ["create_file", "read_file", "search_files"],
-    "test_code": ["create_file", "read_file", "run_unit_tests", "search_files"],
+    "html_code":    ["create_file", "read_file", "search_files"],
+    "js_code":      ["create_file", "replace_range", "append_to_file", "read_file", "search_files"],
+    "css_code":     ["create_file", "replace_range", "append_to_file", "insert_after_marker", "read_file", "search_files"],
+    "test_code":    ["create_file", "replace_range", "read_file", "run_unit_tests", "search_files"],
 }
 
 # Max iterations for the test feedback loop
-TEST_STAGE_MAX_ITERATIONS = 5
+TEST_STAGE_MAX_ITERATIONS = 8
 
-# Per-stage max ReAct turns (overridable via ORCHESTRATOR_REACT_MAX_ITERS_<STAGE>)
+# Per-stage max ReAct turns (overridable via ORCHESTRATOR_REACT_MAX_ITERS_<STAGE>).
+# These are safety valves only — the real stop condition is "primary file written".
+# High defaults prevent stages from failing just because early turns were burned on 500 retries.
 REACT_STAGE_MAX_ITERATIONS: dict[str, int] = {
-    "feature_plan": 4,
-    "html_code": 5,
-    "js_code": 6,
-    "css_code": 5,
+    "feature_plan": 6,
+    "html_code": 12,
+    "js_code": 16,
+    "css_code": 16,
 }
 
 # Expected primary output file per coding stage — used as a stop signal
@@ -1115,6 +1119,7 @@ class LoopController:
                     "result": result,
                 })
                 memory.add("tool", json.dumps(result), name=name)
+                self._trim_last_tool_result(memory)
                 executed_count += 1
 
                 if name == "create_file":
@@ -1507,6 +1512,7 @@ class LoopController:
                     "result": result,
                 })
                 memory.add("tool", json.dumps(result), name=name)
+                self._trim_last_tool_result(memory)
                 executed_count += 1
 
                 # Track created files and check primary output stop condition
@@ -2454,6 +2460,27 @@ class LoopController:
                             f"{path} written to disk, refs in PLAN.md]"
                         )
                     return  # only scrub the most-recent write of this path
+
+    def _trim_last_tool_result(self, memory: SessionMemory, max_chars: int = 800) -> None:
+        """Trim the most-recently-added tool message in place, immediately after it is stored.
+
+        Called right after every memory.add("tool", ...) so tool results are lean
+        from the moment they enter the KV cache — not only when the budget overflows.
+        This is the Claude Code "extract specific info, discard the fluff" pattern
+        applied per-turn rather than as a batch cleanup.
+        """
+        if not memory.messages:
+            return
+        msg = memory.messages[-1]
+        if msg.get("role") != "tool":
+            return
+        content = str(msg.get("content") or "")
+        if len(content) <= max_chars:
+            return
+        head = content[:400]
+        tail = content[-300:]
+        trimmed = len(content) - 700
+        msg["content"] = head + f"\n... [{trimmed} chars trimmed] ...\n" + tail
 
     def _truncate_tool_results(self, memory: SessionMemory, max_chars: int = 600) -> None:
         """Trim large tool result messages to head + tail (600 chars default).
