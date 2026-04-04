@@ -993,6 +993,9 @@ class LoopController:
             )
             memory.add("user", prompt)
 
+            # Context management stage — runs before every LLM call
+            self._run_context_management(memory, stage_name)
+
             num_predict = _env_int("ORCHESTRATOR_CODE_NUM_PREDICT", 16384)
             test_slim = self._slim_context_for_call(memory)
             test_ctx = self._needed_num_ctx(test_slim, stage_tools, num_predict)
@@ -1432,6 +1435,9 @@ class LoopController:
         for react_iter in range(max_iters):
             turn_label = f"turn {react_iter + 1}/{max_iters}"
             print(f"[status:agent] {stage_name} ({turn_label})", file=sys.stderr, flush=True)
+
+            # Context management stage — runs before every LLM call
+            self._run_context_management(memory, stage_name)
 
             content, tool_calls = self._single_react_turn(
                 stage_name=stage_name,
@@ -2460,6 +2466,36 @@ class LoopController:
                             f"{path} written to disk, refs in PLAN.md]"
                         )
                     return  # only scrub the most-recent write of this path
+
+    def _run_context_management(self, memory: SessionMemory, stage_name: str) -> None:
+        """Dedicated per-iteration context management stage.
+
+        Called at the TOP of every loop iteration — before the LLM call — so the
+        model always receives a lean context rather than a bloated one that causes
+        HTTP 500s. This is the Claude Code 'noise reduction before every call'
+        pattern made explicit.
+
+        Steps:
+        1. Truncate all tool result messages to head+tail (cheapest, always safe).
+        2. Run full compaction if over the soft budget (summarises middle messages).
+        3. Emit a '[context] N chars (~M tokens)' line to the reasoning stream so
+           context growth is visible in the Reasoning column.
+        """
+        # Step 1: always truncate tool results (even if under budget)
+        self._truncate_tool_results(memory)
+
+        # Step 2: compact if over budget (also calls _truncate_tool_results internally,
+        # but that's idempotent and cheap)
+        self._compact_memory(memory)
+
+        # Step 3: emit current context size to reasoning stream
+        total_chars = self._count_message_chars(memory.messages)
+        approx_tokens = total_chars // 3
+        self._emit_reasoning_raw(
+            "context",
+            f"[context] {total_chars:,} chars (~{approx_tokens:,} tokens) in memory "
+            f"across {len(memory.messages)} messages",
+        )
 
     def _trim_last_tool_result(self, memory: SessionMemory, max_chars: int = 800) -> None:
         """Trim the most-recently-added tool message in place, immediately after it is stored.
