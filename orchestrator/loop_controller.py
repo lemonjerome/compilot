@@ -724,14 +724,14 @@ class LoopController:
                 "",
             ])
 
-        # For existing projects, include current HTML for reference
+        # For existing projects, include current HTML (truncated) for reference
         if not workspace_state["is_empty"]:
             html_content = self._read_created_files(
-                created_files, extensions={".html"},
+                created_files, extensions={".html"}, max_chars_per_file=3000,
             )
             if html_content:
                 lines.extend([
-                    "=== CURRENT HTML (existing file — rewrite completely) ===",
+                    "=== CURRENT HTML (truncated — rewrite completely) ===",
                     html_content,
                     "=== END CURRENT HTML ===",
                     "",
@@ -797,26 +797,24 @@ class LoopController:
                 "",
             ])
 
-        # Include completed HTML so JS references exact IDs
-        html_content = self._read_created_files(
-            created_files, extensions={".html"},
-        )
-        if html_content:
+        # Include HTML element reference so JS uses exact IDs — compact summary, not full file
+        html_ref = self._build_html_ref_compact()
+        if html_ref:
             lines.extend([
-                "=== COMPLETED HTML (reference element IDs from this) ===",
-                html_content,
-                "=== END COMPLETED HTML ===",
+                "=== HTML ELEMENT REFERENCE (use these exact IDs/classes) ===",
+                html_ref,
+                "=== END REFERENCE ===",
                 "",
             ])
 
-        # For existing projects, include current JS for reference
+        # For existing projects, include current JS (truncated) for reference
         if not workspace_state["is_empty"]:
             js_content = self._read_created_files(
-                created_files, extensions={".js"},
+                created_files, extensions={".js"}, max_chars_per_file=3000,
             )
             if js_content:
                 lines.extend([
-                    "=== CURRENT JS (existing file — rewrite completely) ===",
+                    "=== CURRENT JS (truncated — rewrite completely) ===",
                     js_content,
                     "=== END CURRENT JS ===",
                     "",
@@ -884,38 +882,34 @@ class LoopController:
                 "",
             ])
 
-        # Include completed HTML so CSS targets exact elements
-        html_content = self._read_created_files(
-            created_files, extensions={".html"},
-        )
-        if html_content:
+        # Include HTML element reference so CSS targets exact selectors — compact, not full file
+        html_ref = self._build_html_ref_compact()
+        if html_ref:
             lines.extend([
-                "=== COMPLETED HTML (target selectors from this) ===",
-                html_content,
-                "=== END COMPLETED HTML ===",
+                "=== HTML ELEMENT REFERENCE (target these IDs/classes) ===",
+                html_ref,
+                "=== END REFERENCE ===",
                 "",
             ])
 
-        # Include completed JS so CSS can see what classes JS toggles and creates
-        js_content = self._read_created_files(
-            created_files, extensions={".js"},
-        )
-        if js_content:
+        # Include JS dynamic class list so CSS styles every toggled/created class
+        js_class_ref = self._build_js_class_compact()
+        if js_class_ref:
             lines.extend([
-                "=== COMPLETED JS (style every class name used here) ===",
-                js_content,
-                "=== END COMPLETED JS ===",
+                "=== JS DYNAMIC CLASSES (must define CSS rules for ALL of these) ===",
+                js_class_ref,
+                "=== END JS CLASSES ===",
                 "",
             ])
 
-        # For existing projects, include current CSS for reference
+        # For existing projects, include current CSS (truncated) for reference
         if not workspace_state["is_empty"]:
             css_content = self._read_created_files(
-                created_files, extensions={".css"},
+                created_files, extensions={".css"}, max_chars_per_file=3000,
             )
             if css_content:
                 lines.extend([
-                    "=== CURRENT CSS (existing file — rewrite completely) ===",
+                    "=== CURRENT CSS (truncated — rewrite completely) ===",
                     css_content,
                     "=== END CURRENT CSS ===",
                     "",
@@ -1346,15 +1340,22 @@ class LoopController:
                     return "", []
             elif "HTTP error 500" in err_msg or "Internal Server Error" in err_msg:
                 # Server-side crash — often caused by context overflow. Retry with
-                # a truncated message list (system + last 6 messages) and no ctx override.
+                # a minimal message list: system + PLAN.md + last 4 messages.
                 self._emit_reasoning(stage_name, "Server error (500), retrying with reduced context...")
                 self._current_stage_info.setdefault("errors", []).append("HTTP 500 — retried with reduced context")
                 system_msgs = [m for m in memory.messages if m.get("role") == "system"]
-                recent_msgs = [m for m in memory.messages if m.get("role") != "system"][-6:]
+                recent_msgs = [m for m in memory.messages if m.get("role") != "system"][-4:]
+                plan_content = self._read_plan_md()
+                plan_msgs: list[dict[str, Any]] = []
+                if plan_content.strip():
+                    plan_msgs.append({
+                        "role": "user",
+                        "content": "[PLAN.md — project reference]\n" + plan_content,
+                    })
                 try:
                     response = self.ollama_client.chat(
                         model=self.model_name,
-                        messages=system_msgs + recent_msgs,
+                        messages=system_msgs + plan_msgs + recent_msgs,
                         tools=stage_tools,
                         stream=False,
                         num_predict=num_predict,
@@ -2404,6 +2405,41 @@ class LoopController:
         return system_msgs + offload_msgs + tail
 
     # ------------------------------------------------------------------
+    # Compact reference builders (used in stage prompts instead of full files)
+    # ------------------------------------------------------------------
+
+    def _build_html_ref_compact(self) -> str:
+        """Return a compact text summary of HTML element refs extracted after html_code stage.
+
+        Produces ~10-30 lines instead of injecting the full HTML file (100-300 lines).
+        """
+        refs = self._plan_html_refs
+        if not refs:
+            return ""
+        lines = ["HTML Element Reference (extracted from index.html):"]
+        if refs.get("ids"):
+            lines.append("IDs: " + ", ".join(f"#{id_}" for id_ in refs["ids"][:40]))
+        if refs.get("buttons"):
+            lines.append("Buttons:")
+            for id_, label in refs["buttons"][:20]:
+                lines.append(f"  #{id_} — \"{label}\"")
+        if refs.get("modal_ids"):
+            lines.append("Modals (hidden by default, use .hidden): " + ", ".join(f"#{id_}" for id_ in refs["modal_ids"]))
+        meaningful = [c for c in refs.get("classes", []) if c not in {"hidden", "active", "disabled", "btn"}]
+        if meaningful:
+            lines.append("Classes: " + ", ".join(f".{c}" for c in meaningful[:50]))
+        return "\n".join(lines)
+
+    def _build_js_class_compact(self) -> str:
+        """Return a compact one-line summary of JS dynamic classes extracted after js_code stage."""
+        if not self._plan_js_classes:
+            return ""
+        dynamic = [c for c in self._plan_js_classes if c not in {"hidden", "active", "disabled"}]
+        if not dynamic:
+            return ""
+        return "JS Dynamic Classes (must be styled in CSS): " + ", ".join(f".{c}" for c in dynamic)
+
+    # ------------------------------------------------------------------
     # PLAN.md — workspace-level project reference file
     # ------------------------------------------------------------------
 
@@ -2436,7 +2472,9 @@ class LoopController:
 
         if self._stage_summaries:
             lines.append("## [WORKING MEMORY — Stage Outcomes]")
-            for s in self._stage_summaries:
+            # Recency weighting: last 2 stages get full detail; earlier stages get one-liner only.
+            recent_cutoff = max(0, len(self._stage_summaries) - 2)
+            for idx, s in enumerate(self._stage_summaries):
                 stage = s.get("stage", "?")
                 primary_file = STAGE_PRIMARY_FILE.get(stage)
                 written = s.get("primary_written", False)
@@ -2453,10 +2491,12 @@ class LoopController:
                     line += f" ({nudges} nudge{'s' if nudges > 1 else ''})"
                 lines.append(line)
 
-                if reasoning:
-                    lines.append(f"  - Plan: {reasoning[:200]}")
-                for err in errors:
-                    lines.append(f"  - Error handled: {err}")
+                # Full detail only for recent stages
+                if idx >= recent_cutoff:
+                    if reasoning:
+                        lines.append(f"  - Plan: {reasoning[:200]}")
+                    for err in errors:
+                        lines.append(f"  - Error handled: {err}")
 
             lines.append("")
 
