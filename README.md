@@ -76,7 +76,7 @@ Edit `.env` and fill in your values:
 ```
 OLLAMA_API_KEY=your_ollama_cloud_api_key_here
 OLLAMA_BASE_URL=https://ollama.com
-ORCHESTRATOR_MODEL=qwen3-coder-next
+ORCHESTRATOR_MODEL=qwen3.5
 ```
 
 Your Ollama API key is available in your Ollama Cloud account dashboard.
@@ -156,7 +156,7 @@ Each stage runs multiple turns, not a single call. On each turn the model can:
 - Call `create_file` to write the complete output file.
 - Return plain text (no tool calls) to signal the stage is done.
 
-Turn limits per stage: `feature_plan` 4, `html_code` 5, `js_code` 6, `css_code` 5. Override with environment variables.
+Turn limits per stage: `feature_plan` 6, `html_code` 12, `js_code` 16, `css_code` 16. Override with environment variables.
 
 ### Nudge logic
 
@@ -169,6 +169,9 @@ The agent communicates with the workspace through a local **MCP server** — a J
 | Tool | What it does |
 |---|---|
 | `create_file` | Write a complete file to the workspace. |
+| `replace_range` | Replace a contiguous line range in an existing file. Used for surgical fixes without rewriting. |
+| `append_to_file` | Append content to an existing file without rewriting it. |
+| `insert_after_marker` | Insert content immediately after a unique marker string in a file. |
 | `read_file` | Read a file (size-limited). |
 | `list_directory` | List workspace contents. |
 | `search_files` | Glob pattern + optional content substring search. |
@@ -198,7 +201,19 @@ HTML is the source of truth. JS must reference only IDs and classes defined in t
 
 ### Memory and context management
 
-Conversation history is compacted when it exceeds a character budget. The compactor uses structured extraction: it records which files were created, which tool calls were made (tool name + target path, not the KB-sized content), and the first reasoning line per assistant turn. Large stage prompts in the middle of history are collapsed to their label line only.
+Context is managed at multiple levels to prevent HTTP 500s on the shared Ollama Cloud server:
+
+**Dynamic `num_ctx`** — each API call requests only the context window it actually needs. The controller measures the payload (message chars + tool schema chars), estimates token count, adds 20% overhead and the `num_predict` budget, then rounds up to the nearest 8192. This prevents allocating a fixed 200k KV cache for a 20k-token payload.
+
+**Per-iteration pruning** — a `_run_context_management` step runs at the top of every loop iteration before the LLM call. It truncates all tool results to a head+tail summary and triggers compaction if over the soft budget (600k chars / ~200k tokens).
+
+**Per-turn tool result trimming** — every `read_file` result is trimmed to 800 chars immediately after being stored in memory, not only when the budget overflows.
+
+**Content scrubbing** — once `create_file` succeeds, the full file content stored in that tool call's arguments (8–15k chars) is replaced with a one-line stub. The file is on disk and cross-file refs are in `PLAN.md` — it does not need to stay in the KV cache.
+
+**Compact HTML/JS refs** — coding stage prompts inject 10–30 line summaries of element IDs, buttons, modals, and dynamic classes rather than the full source files (100–300 lines each).
+
+**Compaction algorithm** — when over budget, the compactor preserves the first 2 messages and the last 16 verbatim, then replaces everything in between with a structured summary of which files were created, which tools were called, and one reasoning snippet per turn.
 
 Critical rules are appended at the **end** of each coding stage prompt in addition to appearing at the start. This is position-aware: attention recall is highest at the beginning and end of a context (U-shaped curve) and lowest in the middle where large skill guides sit.
 
